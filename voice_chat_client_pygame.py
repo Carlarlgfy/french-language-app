@@ -5,14 +5,14 @@ Push-to-talk GUI. Bilingual EN/FR with auto language detection.
 Voices: en_US-ryan-high / fr_FR-siwis-medium (Piper)
 LLM: qwen3-8b on thebrain via LM Studio
 """
-import os, sys, wave, tempfile, threading, time, math
+import os, sys, wave, tempfile, threading, time, math, subprocess
 import numpy as np
 import pygame
 import sounddevice as sd
 import soundfile as sf
 from openai import OpenAI
 from faster_whisper import WhisperModel
-from piper.voice import PiperVoice
+from piper.voice import PiperVoice, SynthesisConfig
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
@@ -110,6 +110,11 @@ class VoiceChatApp:
         
         # Test audio state
         self.beeping = False
+
+        # Speed slider: 0.5 (50%) to 1.0 (100%)
+        self.speech_rate = 1.0
+        self.slider_dragging = False
+        self._slider_track = None
         
         # Load models in background
         threading.Thread(target=self._load_models, daemon=True).start()
@@ -180,7 +185,10 @@ class VoiceChatApp:
         # Status bar
         status_surf = self.font_small.render(self.status_msg, True, C["dim"])
         self.screen.blit(status_surf, (18, self.height - 240))
-        
+
+        # Speed slider
+        self._draw_speed_slider()
+
         # Mic button
         self._draw_mic_button()
         
@@ -218,6 +226,40 @@ class VoiceChatApp:
         if current_line:
             lines.append(current_line.strip())
         return lines
+
+    def _draw_speed_slider(self):
+        cy = self.height - 220  # Vertical center of slider row
+
+        label = f"SPEED {int(self.speech_rate * 100)}%"
+        label_surf = self.font_small.render(label, True, C["dim"])
+        self.screen.blit(label_surf, (18, cy - label_surf.get_height() // 2))
+
+        track_x = 18 + label_surf.get_width() + 10
+        track_x_end = self.width - 18
+        track_w = track_x_end - track_x
+
+        # Store hit rect for mouse events (slightly taller than visual track)
+        self._slider_track = pygame.Rect(track_x, cy - 8, track_w, 16)
+
+        # Track background
+        pygame.draw.rect(self.screen, C["border"], (track_x, cy - 2, track_w, 4), border_radius=2)
+
+        # Filled portion (left = 50%, right = 100%)
+        fraction = (self.speech_rate - 0.5) / 0.5
+        filled_w = int(fraction * track_w)
+        if filled_w > 0:
+            pygame.draw.rect(self.screen, C["ring_idle"], (track_x, cy - 2, filled_w, 4), border_radius=2)
+
+        # Handle
+        handle_x = track_x + filled_w
+        pygame.draw.circle(self.screen, C["panel"], (handle_x, cy), 8)
+        pygame.draw.circle(self.screen, C["ring_idle"], (handle_x, cy), 8, 2)
+
+        # End labels
+        lo_surf = self.font_small.render("50%", True, C["sys"])
+        hi_surf = self.font_small.render("100%", True, C["sys"])
+        self.screen.blit(lo_surf, (track_x, cy + 10))
+        self.screen.blit(hi_surf, (track_x_end - hi_surf.get_width(), cy + 10))
 
     def _draw_mic_button(self):
         cfg = {
@@ -381,58 +423,62 @@ class VoiceChatApp:
             self._set_status("Ready — click the mic to speak")
 
     def _speak(self, text, lang, line_idx=None):
-        """Speak text word-by-word with highlighting"""
+        """Speak full text with word highlighting using system audio player"""
         voice = self.voices.get(lang) or self.voices.get("en")
-        
-        # Split into words
         words = text.split()
-        self.speaking_line_idx = line_idx
         
-        if self.stream:
-            self.stream.stop()
+        if not words:
+            return
+        
+        self.speaking_line_idx = line_idx
+        wav_path = None
         
         try:
-            for word_idx, word in enumerate(words):
-                if not self.running:  # Stop if app is closing
-                    break
-                
-                # Update which word is being spoken
+            # Synthesize ENTIRE text once
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                wav_path = f.name
+            
+            syn_config = SynthesisConfig(length_scale=1.0 / self.speech_rate)
+            with wave.open(wav_path, "wb") as wf:
+                voice.synthesize_wav(text, wf, syn_config=syn_config)
+
+            file_size = os.path.getsize(wav_path)
+            if file_size <= 44:
+                print(f"[TTS] Synthesis produced no audio ({file_size} bytes)", file=sys.stderr)
+                return
+
+            # Get audio duration
+            audio, sr = sf.read(wav_path, dtype="float32")
+            total_duration = len(audio) / sr
+            time_per_word = total_duration / len(words)
+
+            # Play audio using system command (paplay - PipeWire)
+            proc = subprocess.Popen(["paplay", wav_path],
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.PIPE)
+            
+            # Highlight words while audio plays
+            for word_idx in range(len(words)):
                 self.speaking_word_idx = word_idx
-                
-                wav_path = None
-                try:
-                    # Generate audio for this word
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                        wav_path = f.name
-                    
-                    with wave.open(wav_path, "wb") as wf:
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(voice.config.sample_rate)
-                        voice.synthesize(word, wf)
-                    
-                    # Play the word
-                    audio, sr = sf.read(wav_path, dtype="float32")
-                    sd.play(audio, sr)
-                    sd.wait()
-                    
-                    # Small pause between words
-                    time.sleep(0.2)
-                    
-                except Exception as e:
-                    self._set_status(f"Word '{word}' error: {e}")
-                finally:
-                    if wav_path and os.path.exists(wav_path):
-                        os.unlink(wav_path)
-        
+                time.sleep(time_per_word)
+            
+            # Wait for playback to finish
+            proc.wait(timeout=30)
+            if proc.returncode != 0:
+                err = proc.stderr.read().decode(errors="replace").strip()
+                print(f"[TTS] paplay failed (rc={proc.returncode}): {err}", file=sys.stderr)
+            
         except Exception as e:
             self._set_status(f"TTS error: {e}")
         finally:
             # Clear highlighting
             self.speaking_line_idx = None
             self.speaking_word_idx = None
-            if self.stream:
-                self.stream.start()
+            if wav_path and os.path.exists(wav_path):
+                try:
+                    os.unlink(wav_path)
+                except:
+                    pass
 
     def _play_beep(self):
         sr = 48000
@@ -461,11 +507,21 @@ class VoiceChatApp:
     def _set_status(self, msg):
         self.status_msg = msg
 
+    def _update_speech_rate(self, mouse_x):
+        if self._slider_track is None:
+            return
+        fraction = (mouse_x - self._slider_track.x) / self._slider_track.width
+        fraction = max(0.0, min(1.0, fraction))
+        self.speech_rate = 0.5 + fraction * 0.5  # maps 0→50%, 1→100%
+
     def handle_event(self, event):
         if event.type == pygame.QUIT:
             self.running = False
         elif event.type == pygame.MOUSEBUTTONDOWN:
-            if self.btn_mic_rect.collidepoint(event.pos):
+            if self._slider_track and self._slider_track.collidepoint(event.pos):
+                self.slider_dragging = True
+                self._update_speech_rate(event.pos[0])
+            elif self.btn_mic_rect.collidepoint(event.pos):
                 if self.state == "idle":
                     self._start_rec()
                 elif self.state == "recording":
@@ -473,18 +529,21 @@ class VoiceChatApp:
             elif self.test_btn_rect.collidepoint(event.pos):
                 self.beeping = True
                 threading.Thread(target=self._play_beep, daemon=True).start()
+        elif event.type == pygame.MOUSEMOTION:
+            if self.slider_dragging:
+                self._update_speech_rate(event.pos[0])
         elif event.type == pygame.MOUSEBUTTONUP:
-            # Stop beeping on any mouse button release
+            self.slider_dragging = False
             self.beeping = False
             sd.stop()
         elif event.type == pygame.MOUSEWHEEL:
-            self.scroll_offset = max(0, min(self.max_scroll, 
+            self.scroll_offset = max(0, min(self.max_scroll,
                                             self.scroll_offset - event.y * 30))
         elif event.type == pygame.VIDEORESIZE:
             self.width, self.height = event.size
-            self.btn_mic_rect = pygame.Rect(self.width // 2 - 65, 
+            self.btn_mic_rect = pygame.Rect(self.width // 2 - 65,
                                            self.height - 200, 130, 130)
-            self.test_btn_rect = pygame.Rect(self.width // 2 - 75, 
+            self.test_btn_rect = pygame.Rect(self.width // 2 - 75,
                                             self.height - 60, 150, 40)
 
     def run(self):
