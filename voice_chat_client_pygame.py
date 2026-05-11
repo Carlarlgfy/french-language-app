@@ -5,7 +5,7 @@ Push-to-talk GUI. Bilingual EN/FR with auto language detection.
 Voices: en_US-ryan-high / fr_FR-siwis-medium (Piper)
 LLM: qwen3-8b on thebrain via LM Studio
 """
-import os, sys, wave, tempfile, threading, time, math, subprocess
+import os, sys, wave, tempfile, threading, time, math, subprocess, re, io
 import numpy as np
 import pygame
 import sounddevice as sd
@@ -28,17 +28,76 @@ VOICE_FILES = {
 
 SYSTEM_PROMPT = (
     "You are a warm, encouraging bilingual French-English conversation tutor. "
-    "Rules you must always follow:\n"
-    "- If the user speaks French, reply entirely in French.\n"
-    "- If the user speaks English, reply in English.\n"
+    "Each user message ends with an instruction in [square brackets] — follow it exactly.\n"
+    "General rules:\n"
     "- Keep every reply to 2-4 sentences maximum — you are speaking aloud.\n"
     "- Never use markdown, bullet points, headers, asterisks, or any formatting.\n"
     "- Plain conversational sentences only.\n"
-    "- When the user makes a French grammar mistake, correct it naturally inside "
-    "your reply without making it feel like a lesson.\n"
+    "- Never repeat or translate the user's question back to them. Just answer it.\n"
+    "- When the user makes a French grammar mistake, correct it naturally.\n"
     "- Be warm, natural, and encouraging.\n"
+    "Language tagging rule — ALWAYS apply this:\n"
+    "Wrap every run of French words with [FR]...[/FR] and every run of English words "
+    "with [EN]...[/EN]. Apply tags to ALL words in your reply, even in single-language "
+    "replies. Example of a mixed reply: "
+    "[EN]The word[/EN] [FR]alors[/FR] [EN]means 'then' or 'so'.[/EN] "
+    "Example of a French-only reply: [FR]Bonjour ! Comment puis-je vous aider ?[/FR]\n"
     "/no_think"
 )
+
+# ── Language tag helpers ───────────────────────────────────────────────────────
+_TAG_RE = re.compile(r'\[(FR|EN)\](.*?)\[/\1\]', re.IGNORECASE | re.DOTALL)
+
+def _parse_lang_tags(text: str, default_lang: str = "en") -> list:
+    """Return [(lang, text), ...] from a tagged LLM response.
+    Untagged runs fall back to default_lang."""
+    segments = []
+    last_end = 0
+    for m in _TAG_RE.finditer(text):
+        before = text[last_end:m.start()].strip()
+        if before:
+            segments.append((default_lang, before))
+        seg_text = m.group(2).strip()
+        if seg_text:
+            segments.append((m.group(1).lower(), seg_text))
+        last_end = m.end()
+    after = text[last_end:].strip()
+    if after:
+        segments.append((default_lang, after))
+    return segments or [(default_lang, text)]
+
+def _strip_lang_tags(text: str) -> str:
+    """Remove [FR]/[EN] tags, keeping the inner text."""
+    return _TAG_RE.sub(lambda m: m.group(2), text).strip()
+
+# Patterns that signal a cross-language translation question
+_CROSS_EN = re.compile(
+    r"\b(how (do you |to )?say|what does .+ mean|translate|in french|en fran[cç]ais"
+    r"|what('?s| is) .+ in french)\b",
+    re.IGNORECASE,
+)
+_CROSS_FR = re.compile(
+    r"\b(comment dit-?on|que (veut dire|signifie)|qu'?est-?ce que .+ veut dire"
+    r"|en anglais|comment (se dit|s'?appelle|traduit))\b",
+    re.IGNORECASE,
+)
+
+def _build_lang_directive(text: str, detected: str) -> str:
+    is_cross = bool(_CROSS_EN.search(text)) or bool(_CROSS_FR.search(text))
+    if is_cross:
+        if detected == "fr":
+            return (
+                "Cross-language question in French. Answer in French but state the "
+                "English word/phrase. Tag ALL words with [FR]...[/FR] or [EN]...[/EN]."
+            )
+        else:
+            return (
+                "Cross-language question in English. Answer in English but state the "
+                "French word/phrase. Tag ALL words with [FR]...[/FR] or [EN]...[/EN]."
+            )
+    if detected == "fr":
+        return "Reply in French only. Tag every word: [FR]...[/FR]."
+    return "Reply in English only. Tag every word: [EN]...[/EN]."
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 C = {
@@ -244,8 +303,8 @@ class VoiceChatApp:
         # Track background
         pygame.draw.rect(self.screen, C["border"], (track_x, cy - 2, track_w, 4), border_radius=2)
 
-        # Filled portion (left = 50%, right = 100%)
-        fraction = (self.speech_rate - 0.5) / 0.5
+        # Filled portion (left = 50%, right = 200%)
+        fraction = (self.speech_rate - 0.5) / 1.5
         filled_w = int(fraction * track_w)
         if filled_w > 0:
             pygame.draw.rect(self.screen, C["ring_idle"], (track_x, cy - 2, filled_w, 4), border_radius=2)
@@ -257,7 +316,7 @@ class VoiceChatApp:
 
         # End labels
         lo_surf = self.font_small.render("50%", True, C["sys"])
-        hi_surf = self.font_small.render("100%", True, C["sys"])
+        hi_surf = self.font_small.render("200%", True, C["sys"])
         self.screen.blit(lo_surf, (track_x, cy + 10))
         self.screen.blit(hi_surf, (track_x_end - hi_surf.get_width(), cy + 10))
 
@@ -385,12 +444,11 @@ class VoiceChatApp:
                 self.running = False
                 return
 
-            # LLM
-            lang_directive = "(Répondre en français.)" if detected == "fr" \
-                             else "(Reply in English.)"
+            # Build a per-turn directive so the model knows exactly what to do
+            lang_directive = _build_lang_directive(user_text, detected)
             self.conversation.append({
                 "role": "user",
-                "content": f"{user_text}  {lang_directive}",
+                "content": f"{user_text}  [{lang_directive}]",
             })
 
             self._set_status("Thinking on thebrain…")
@@ -408,7 +466,8 @@ class VoiceChatApp:
                 reply = "Je ne sais pas." if detected == "fr" else "I'm not sure."
 
             self.conversation.append({"role": "assistant", "content": reply})
-            ai_line_idx = self._log("AI", detected, reply)
+            clean_reply = _strip_lang_tags(reply)
+            ai_line_idx = self._log("AI", detected, clean_reply)
 
             self._set_state("speaking")
             self._set_status(f"Speaking in {flag}…")
@@ -423,61 +482,75 @@ class VoiceChatApp:
             self._set_status("Ready — click the mic to speak")
 
     def _speak(self, text, lang, line_idx=None):
-        """Speak full text with word highlighting using system audio player"""
-        voice = self.voices.get(lang) or self.voices.get("en")
-        words = text.split()
-        
-        if not words:
+        """Word-by-word synthesis with exact per-word highlight timing."""
+        # Parse language tags from LLM output
+        segments = _parse_lang_tags(text, default_lang=lang)
+
+        # Build flat (voice, word) list in display order, skipping bare punctuation
+        word_voice_pairs = []
+        for seg_lang, seg_text in segments:
+            voice = self.voices.get(seg_lang) or self.voices.get("en")
+            for word in seg_text.split():
+                if re.search(r"[A-Za-zÀ-öø-ÿ0-9]", word):  # must have speakable chars
+                    word_voice_pairs.append((voice, word))
+
+        if not word_voice_pairs:
             return
-        
+
         self.speaking_line_idx = line_idx
         wav_path = None
-        
+
         try:
-            # Synthesize ENTIRE text once
+            SR = 22050
+            syn_config = SynthesisConfig(length_scale=1.0 / self.speech_rate)
+            # Short gap between words; scales with speech_rate so proportions stay constant
+            gap = np.zeros(int(SR * 0.06 / self.speech_rate), dtype="float32")
+
+            # Synthesize every word individually → exact per-word duration
+            word_audios = []
+            for voice, word in word_voice_pairs:
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as wf:
+                    voice.synthesize_wav(word, wf, syn_config=syn_config)
+                buf.seek(0)
+                audio, _ = sf.read(buf, dtype="float32")
+                word_audios.append(audio)
+
+            # Interleave word audio with gaps → combined WAV
+            parts = []
+            for audio in word_audios:
+                parts.append(audio)
+                parts.append(gap)
+            combined = np.concatenate(parts)
+
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 wav_path = f.name
-            
-            syn_config = SynthesisConfig(length_scale=1.0 / self.speech_rate)
-            with wave.open(wav_path, "wb") as wf:
-                voice.synthesize_wav(text, wf, syn_config=syn_config)
+            sf.write(wav_path, combined, SR)
 
-            file_size = os.path.getsize(wav_path)
-            if file_size <= 44:
-                print(f"[TTS] Synthesis produced no audio ({file_size} bytes)", file=sys.stderr)
-                return
-
-            # Get audio duration
-            audio, sr = sf.read(wav_path, dtype="float32")
-            total_duration = len(audio) / sr
-            time_per_word = total_duration / len(words)
-
-            # Play audio using system command (paplay - PipeWire)
             proc = subprocess.Popen(["paplay", wav_path],
-                                   stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.PIPE)
-            
-            # Highlight words while audio plays
-            for word_idx in range(len(words)):
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE)
+
+            # Highlight each word for exactly as long as its audio + gap lasts
+            for word_idx, audio in enumerate(word_audios):
                 self.speaking_word_idx = word_idx
-                time.sleep(time_per_word)
-            
-            # Wait for playback to finish
+                time.sleep((len(audio) + len(gap)) / SR)
+
             proc.wait(timeout=30)
             if proc.returncode != 0:
                 err = proc.stderr.read().decode(errors="replace").strip()
-                print(f"[TTS] paplay failed (rc={proc.returncode}): {err}", file=sys.stderr)
-            
+                print(f"[TTS] paplay failed: {err}", file=sys.stderr)
+
         except Exception as e:
+            print(f"[TTS] Exception: {e}", file=sys.stderr)
             self._set_status(f"TTS error: {e}")
         finally:
-            # Clear highlighting
             self.speaking_line_idx = None
             self.speaking_word_idx = None
             if wav_path and os.path.exists(wav_path):
                 try:
                     os.unlink(wav_path)
-                except:
+                except Exception:
                     pass
 
     def _play_beep(self):
@@ -512,7 +585,7 @@ class VoiceChatApp:
             return
         fraction = (mouse_x - self._slider_track.x) / self._slider_track.width
         fraction = max(0.0, min(1.0, fraction))
-        self.speech_rate = 0.5 + fraction * 0.5  # maps 0→50%, 1→100%
+        self.speech_rate = 0.5 + fraction * 1.5  # maps 0→50%, 1→200%
 
     def handle_event(self, event):
         if event.type == pygame.QUIT:
