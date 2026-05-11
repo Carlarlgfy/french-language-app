@@ -140,6 +140,15 @@ class VoiceChatApp:
         tk.Label(bar, textvariable=self.hint_var, bg=C["bg"], fg=C["dim"],
                  font=("DejaVu Sans", 9)).pack()
 
+        # Audio test button
+        test_btn = tk.Button(bar, text="⬤ HOLD TO TEST AUDIO", bg="#1a0030", fg="#aa66ff",
+                             font=("DejaVu Sans", 9, "bold"), relief=tk.FLAT,
+                             activebackground="#330055", activeforeground="#ffffff",
+                             bd=0, padx=10, pady=4)
+        test_btn.pack(pady=(10, 0))
+        test_btn.bind("<ButtonPress-1>",   self._beep_start)
+        test_btn.bind("<ButtonRelease-1>", self._beep_stop)
+
         self._draw_btn("loading")
 
     def _draw_btn(self, state: str):
@@ -321,25 +330,66 @@ class VoiceChatApp:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wav_path = f.name
         try:
-            # Synthesize speech to WAV file
             with wave.open(wav_path, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(voice.config.sample_rate)
                 voice.synthesize(text, wf)
 
-            # Play via paplay (PipeWire/PulseAudio) — runs as a separate process,
-            # no conflict with the PortAudio input stream
-            result = subprocess.run(["paplay", wav_path],
-                                    capture_output=True, text=True)
-            if result.returncode != 0:
-                # paplay failed — show the actual error on screen
-                self._status(f"Audio error: {result.stderr.strip() or 'paplay failed'}")
+            if self.stream:
+                self.stream.stop()
+            try:
+                audio, sr = sf.read(wav_path, dtype="float32")
+                # Device 15 = PipeWire — handles sample rate conversion and
+                # routes to whatever output the system is configured for
+                sd.play(audio, sr, device=15)
+                sd.wait()
+            except Exception as play_err:
+                self._log_err(f"sd.play pw failed: {play_err}")
+                try:
+                    # Fallback: pulse device
+                    sd.play(audio, sr, device=16)
+                    sd.wait()
+                except Exception as e2:
+                    self._log_err(f"sd.play pulse failed: {e2}")
+                    self._status(f"Audio error: {e2}")
+            finally:
+                if self.stream:
+                    self.stream.start()
         except Exception as e:
+            self._log_err(f"_speak error: {e}")
             self._status(f"TTS error: {e}")
         finally:
             if os.path.exists(wav_path):
                 os.unlink(wav_path)
+
+    def _log_err(self, msg: str):
+        with open("/tmp/voicechat.log", "a") as f:
+            f.write(f"{msg}\n")
+
+    def _beep_start(self, _=None):
+        self._beeping = True
+        threading.Thread(target=self._play_beep, daemon=True).start()
+
+    def _beep_stop(self, _=None):
+        self._beeping = False
+        sd.stop()
+
+    def _play_beep(self):
+        sr = 48000
+        freq = 440
+        t = np.linspace(0, 1, sr, endpoint=False)
+        tone = (np.sin(2 * np.pi * freq * t) * 0.3).astype("float32")
+        try:
+            sd.play(np.tile(tone, 10), sr, device=15)
+            sd.wait()
+        except Exception as e:
+            self._log_err(f"beep device 15 failed: {e}")
+            try:
+                sd.play(np.tile(tone, 10), sr, device=16)
+                sd.wait()
+            except Exception as e2:
+                self._log_err(f"beep device 16 failed: {e2}")
 
     # ── Transcript ────────────────────────────────────────────────────────────
     def _log(self, speaker: str, lang: str, text: str, is_ai: bool):
