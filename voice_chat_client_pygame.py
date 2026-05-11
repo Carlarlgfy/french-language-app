@@ -18,7 +18,7 @@ from piper.voice import PiperVoice, SynthesisConfig
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 VOICES_DIR   = os.path.join(BASE_DIR, "voices")
 THEBRAIN_URL = "http://192.168.2.12:1234/v1"
-MODEL        = "qwen3-8b"
+MODEL        = "google/gemma-3-4b"
 SAMPLE_RATE  = 16000
 
 VOICE_FILES = {
@@ -36,13 +36,12 @@ SYSTEM_PROMPT = (
     "- Never repeat or translate the user's question back to them. Just answer it.\n"
     "- When the user makes a French grammar mistake, correct it naturally.\n"
     "- Be warm, natural, and encouraging.\n"
-    "Language tagging rule — ALWAYS apply this:\n"
+    "Language tagging rule — always apply this:\n"
     "Wrap every run of French words with [FR]...[/FR] and every run of English words "
     "with [EN]...[/EN]. Apply tags to ALL words in your reply, even in single-language "
     "replies. Example of a mixed reply: "
     "[EN]The word[/EN] [FR]alors[/FR] [EN]means 'then' or 'so'.[/EN] "
-    "Example of a French-only reply: [FR]Bonjour ! Comment puis-je vous aider ?[/FR]\n"
-    "/no_think"
+    "Example of a French-only reply: [FR]Bonjour ! Comment puis-je vous aider ?[/FR]"
 )
 
 # ── Language tag helpers ───────────────────────────────────────────────────────
@@ -482,19 +481,18 @@ class VoiceChatApp:
             self._set_status("Ready — click the mic to speak")
 
     def _speak(self, text, lang, line_idx=None):
-        """Word-by-word synthesis with exact per-word highlight timing."""
-        # Parse language tags from LLM output
+        """Sentence-level synthesis (natural audio) + proportional word highlighting."""
         segments = _parse_lang_tags(text, default_lang=lang)
 
-        # Build flat (voice, word) list in display order, skipping bare punctuation
-        word_voice_pairs = []
+        # Build (voice, seg_text, [words]) per segment, skipping bare punctuation words
+        parsed = []
         for seg_lang, seg_text in segments:
             voice = self.voices.get(seg_lang) or self.voices.get("en")
-            for word in seg_text.split():
-                if re.search(r"[A-Za-zÀ-öø-ÿ0-9]", word):  # must have speakable chars
-                    word_voice_pairs.append((voice, word))
+            words = [w for w in seg_text.split() if re.search(r"[A-Za-zÀ-öø-ÿ0-9]", w)]
+            if words:
+                parsed.append((voice, seg_text, words))
 
-        if not word_voice_pairs:
+        if not parsed:
             return
 
         self.speaking_line_idx = line_idx
@@ -503,26 +501,57 @@ class VoiceChatApp:
         try:
             SR = 22050
             syn_config = SynthesisConfig(length_scale=1.0 / self.speech_rate)
-            # Short gap between words; scales with speech_rate so proportions stay constant
-            gap = np.zeros(int(SR * 0.06 / self.speech_rate), dtype="float32")
+            seg_gap = np.zeros(int(SR * 0.08), dtype="float32")
 
-            # Synthesize every word individually → exact per-word duration
-            word_audios = []
-            for voice, word in word_voice_pairs:
+            # ── Pass 1: synthesize each segment as a whole (natural prosody) ──
+            seg_audios = []
+            for voice, seg_text, _ in parsed:
                 buf = io.BytesIO()
                 with wave.open(buf, "wb") as wf:
-                    voice.synthesize_wav(word, wf, syn_config=syn_config)
+                    voice.synthesize_wav(seg_text, wf, syn_config=syn_config)
                 buf.seek(0)
                 audio, _ = sf.read(buf, dtype="float32")
-                word_audios.append(audio)
+                seg_audios.append(audio)
 
-            # Interleave word audio with gaps → combined WAV
+            # ── Pass 2: synthesize each word alone → duration proportions only ──
+            seg_word_samples = []
+            for voice, _, words in parsed:
+                word_samples = []
+                for word in words:
+                    buf = io.BytesIO()
+                    with wave.open(buf, "wb") as wf:
+                        voice.synthesize_wav(word, wf, syn_config=syn_config)
+                    buf.seek(0)
+                    audio, _ = sf.read(buf, dtype="float32")
+                    word_samples.append(max(len(audio), 1))
+                seg_word_samples.append(word_samples)
+
+            # ── Build combined audio: segments interleaved with gaps ──
             parts = []
-            for audio in word_audios:
-                parts.append(audio)
-                parts.append(gap)
+            for i, audio in enumerate(seg_audios):
+                if audio.size > 0:
+                    parts.append(audio)
+                if i < len(seg_audios) - 1:
+                    parts.append(seg_gap)
+            if not parts:
+                return
             combined = np.concatenate(parts)
 
+            # ── Compute per-word highlight durations (proportional to word audio) ──
+            gap_dur = len(seg_gap) / SR
+            word_durations = []
+            for seg_i, (_, _, words) in enumerate(parsed):
+                seg_dur = len(seg_audios[seg_i]) / SR
+                samples = seg_word_samples[seg_i]
+                total = sum(samples)
+                for w_i, s in enumerate(samples):
+                    dur = seg_dur * s / total
+                    # absorb the inter-segment gap into the last word of this segment
+                    if w_i == len(samples) - 1 and seg_i < len(parsed) - 1:
+                        dur += gap_dur
+                    word_durations.append(dur)
+
+            # ── Play combined audio ──
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 wav_path = f.name
             sf.write(wav_path, combined, SR)
@@ -531,10 +560,9 @@ class VoiceChatApp:
                                     stdout=subprocess.DEVNULL,
                                     stderr=subprocess.PIPE)
 
-            # Highlight each word for exactly as long as its audio + gap lasts
-            for word_idx, audio in enumerate(word_audios):
+            for word_idx, dur in enumerate(word_durations):
                 self.speaking_word_idx = word_idx
-                time.sleep((len(audio) + len(gap)) / SR)
+                time.sleep(dur)
 
             proc.wait(timeout=30)
             if proc.returncode != 0:
