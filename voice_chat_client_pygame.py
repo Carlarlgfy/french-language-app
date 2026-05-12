@@ -169,10 +169,13 @@ class VoiceChatApp:
         # Test audio state
         self.beeping = False
 
-        # Speed slider: 0.5 (50%) to 1.0 (100%)
+        # Speed slider: 0.5 (50%) to 200%
         self.speech_rate = 1.0
         self.slider_dragging = False
         self._slider_track = None
+
+        # Scroll
+        self._scroll_to_bottom = False
         
         # Load models in background
         threading.Thread(target=self._load_models, daemon=True).start()
@@ -237,8 +240,32 @@ class VoiceChatApp:
             
             y += 8
         
-        self.max_scroll = max(0, y - transcript_rect.y - transcript_rect.height)
+        # y + scroll_offset gives scroll-independent content bottom
+        self.max_scroll = max(0, y + self.scroll_offset - transcript_rect.y - transcript_rect.height)
         self.screen.set_clip(clip)
+
+        # Auto-scroll to bottom when new message logged
+        if self._scroll_to_bottom:
+            self.scroll_offset = self.max_scroll
+            self._scroll_to_bottom = False
+
+        # Clamp in case window was resized
+        self.scroll_offset = max(0, min(self.max_scroll, self.scroll_offset))
+
+        # Scrollbar
+        if self.max_scroll > 0:
+            sb_w = 6
+            sb_x = transcript_rect.right - sb_w - 2
+            sb_track_h = transcript_rect.height - 4
+            sb_y = transcript_rect.y + 2
+            thumb_h = max(30, int(sb_track_h * transcript_rect.height /
+                                  (transcript_rect.height + self.max_scroll)))
+            thumb_y = sb_y + int((sb_track_h - thumb_h) *
+                                  self.scroll_offset / self.max_scroll)
+            pygame.draw.rect(self.screen, C["border"],
+                             (sb_x, sb_y, sb_w, sb_track_h), border_radius=3)
+            pygame.draw.rect(self.screen, C["dim"],
+                             (sb_x, thumb_y, sb_w, thumb_h), border_radius=3)
         
         # Status bar
         status_surf = self.font_small.render(self.status_msg, True, C["dim"])
@@ -598,7 +625,7 @@ class VoiceChatApp:
     # ── Transcript ────────────────────────────────────────────────────────────
     def _log(self, speaker, lang, text):
         self.transcript.append((speaker, lang, text, speaker == "AI"))
-        # Return the line index for highlighting
+        self._scroll_to_bottom = True
         return len(self.transcript) - 1
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -637,6 +664,24 @@ class VoiceChatApp:
             self.slider_dragging = False
             self.beeping = False
             sd.stop()
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_SPACE:
+                if self.state == "idle":
+                    self._start_rec()
+                elif self.state == "recording":
+                    self._stop_rec()
+            elif event.key == pygame.K_UP:
+                self.scroll_offset = max(0, self.scroll_offset - 40)
+            elif event.key == pygame.K_DOWN:
+                self.scroll_offset = min(self.max_scroll, self.scroll_offset + 40)
+            elif event.key == pygame.K_PAGEUP:
+                self.scroll_offset = max(0, self.scroll_offset - 200)
+            elif event.key == pygame.K_PAGEDOWN:
+                self.scroll_offset = min(self.max_scroll, self.scroll_offset + 200)
+            elif event.key == pygame.K_END:
+                self.scroll_offset = self.max_scroll
+            elif event.key == pygame.K_HOME:
+                self.scroll_offset = 0
         elif event.type == pygame.MOUSEWHEEL:
             self.scroll_offset = max(0, min(self.max_scroll,
                                             self.scroll_offset - event.y * 30))
