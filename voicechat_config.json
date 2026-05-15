@@ -1,0 +1,8 @@
+{
+  "brain_url": "http://192.168.2.12:1234/v1",
+  "model": "google/gemma-3-4b",
+  "max_history_turns": 10,
+  "brain_start_command": ["ssh", "thebrain@192.168.2.12", "/home/thebrain/start_lmstudio_server.sh"],
+  "brain_start_url": "",
+  "brain_start_url_method": "POST"
+}

@@ -5,7 +5,9 @@ Push-to-talk GUI. Bilingual EN/FR with auto language detection.
 Voices: en_US-ryan-high / fr_FR-siwis-medium (Piper)
 LLM: qwen3-8b on thebrain via LM Studio
 """
-import os, sys, wave, tempfile, threading, time, math, subprocess, re, io
+import os, sys, wave, tempfile, threading, time, math, subprocess, re, io, json, shlex
+import urllib.request
+import urllib.parse
 import numpy as np
 import pygame
 import sounddevice as sd
@@ -17,9 +19,42 @@ from piper.voice import PiperVoice, SynthesisConfig
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 VOICES_DIR   = os.path.join(BASE_DIR, "voices")
-THEBRAIN_URL = "http://192.168.2.12:1234/v1"
-MODEL        = "google/gemma-3-4b"
 SAMPLE_RATE  = 16000
+CONFIG_PATH  = os.path.join(BASE_DIR, "voicechat_config.json")
+LOG_PATH     = "/tmp/voicechat.log"
+
+DEFAULT_CONFIG = {
+    "brain_url": "http://192.168.2.12:1234/v1",
+    "model": "google/gemma-3-4b",
+    "max_history_turns": 10,
+    "brain_start_command": [],
+    "brain_start_url": "",
+    "brain_start_url_method": "POST",
+}
+
+def _load_config():
+    config = DEFAULT_CONFIG.copy()
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                config.update(loaded)
+        except Exception as e:
+            print(f"[CONFIG] Failed to read {CONFIG_PATH}: {e}", file=sys.stderr)
+
+    if os.environ.get("VOICECHAT_BRAIN_URL"):
+        config["brain_url"] = os.environ["VOICECHAT_BRAIN_URL"]
+    if os.environ.get("VOICECHAT_MODEL"):
+        config["model"] = os.environ["VOICECHAT_MODEL"]
+    if os.environ.get("VOICECHAT_BRAIN_START_COMMAND"):
+        config["brain_start_command"] = shlex.split(os.environ["VOICECHAT_BRAIN_START_COMMAND"])
+
+    return config
+
+CONFIG       = _load_config()
+THEBRAIN_URL = CONFIG["brain_url"].rstrip("/")
+MODEL        = CONFIG["model"]
 
 VOICE_FILES = {
     "en": ("en_US-ljspeech-high.onnx",    "en_US-ljspeech-high.onnx.json"),
@@ -145,29 +180,31 @@ class VoiceChatApp:
         self.llm = None
         self.conversation = []
         self.last_lang = "en"
+        self.config = CONFIG
+        self.brain_url = THEBRAIN_URL
+        self.model = MODEL
+        self.max_history_turns = max(1, int(self.config.get("max_history_turns", 10)))
         self.status_msg = "Starting up…"
         self.hint_msg = "loading models"
-        self.lang_badge = "speak EN or FR"
+        self.lang_badge = self._brain_label()
         self.scroll_offset = 0
         self.max_scroll = 0
         
         # Word highlighting for speech
         self.speaking_line_idx = None  # Which transcript line is speaking
         self.speaking_word_idx = None  # Which word in that line
-        self.hint_msg = "loading models"
-        self.lang_badge = "speak EN or FR"
-        self.scroll_offset = 0
-        self.max_scroll = 0
         
         # Transcript lines: (speaker, lang, text, is_ai)
         self.transcript = []
         
         # Buttons
         self.btn_mic_rect = pygame.Rect(self.width // 2 - 65, self.height - 200, 130, 130)
-        self.test_btn_rect = pygame.Rect(self.width // 2 - 75, self.height - 60, 150, 40)
+        self.start_btn_rect = pygame.Rect(self.width // 2 - 170, self.height - 60, 160, 40)
+        self.test_btn_rect = pygame.Rect(self.width // 2 + 10, self.height - 60, 160, 40)
         
         # Test audio state
         self.beeping = False
+        self.brain_starting = False
 
         # Speed slider: 0.5 (50%) to 200%
         self.speech_rate = 1.0
@@ -176,9 +213,13 @@ class VoiceChatApp:
 
         # Scroll
         self._scroll_to_bottom = False
-        
-        # Load models in background
+
+        # Brain connection state
+        self.brain_connected = False
+
+        # Load models in background, then start brain watchdog
         threading.Thread(target=self._load_models, daemon=True).start()
+        threading.Thread(target=self._brain_watchdog, daemon=True).start()
 
     # ── Rendering ─────────────────────────────────────────────────────────────
     def render(self):
@@ -202,8 +243,12 @@ class VoiceChatApp:
         
         y = transcript_rect.y + 10 - self.scroll_offset
         for line_idx, (speaker, lang, text, is_ai) in enumerate(self.transcript):
-            tag_color = self._get_tag_color(is_ai, lang)
-            label = f"{'AI' if is_ai else 'You'} [{lang.upper()}]"
+            if speaker == "SYS":
+                tag_color = C["sys"]
+                label = "●"
+            else:
+                tag_color = self._get_tag_color(is_ai, lang)
+                label = f"{'AI' if is_ai else 'You'} [{lang.upper()}]"
             label_surf = self.font_normal.render(label, True, tag_color)
             self.screen.blit(label_surf, (transcript_rect.x + 14, y))
             y += label_surf.get_height() + 4
@@ -282,11 +327,24 @@ class VoiceChatApp:
         self.screen.blit(hint_surf, (self.width // 2 - hint_surf.get_width() // 2, 
                                      self.height - 90))
         
+        # Start brain button
+        start_bg = (20, 36, 48) if not self.brain_connected else (14, 44, 30)
+        start_fg = (85, 204, 255) if not self.brain_connected else C["ring_talk"]
+        start_label = "BRAIN ONLINE" if self.brain_connected else "START BRAIN"
+        if self.brain_starting:
+            start_label = "STARTING..."
+        pygame.draw.rect(self.screen, start_bg, self.start_btn_rect)
+        pygame.draw.rect(self.screen, start_fg, self.start_btn_rect, 1)
+        start_txt = self.font_small.render(start_label, True, start_fg)
+        self.screen.blit(start_txt, (self.start_btn_rect.centerx - start_txt.get_width() // 2,
+                                     self.start_btn_rect.y + 12))
+
         # Test audio button
         pygame.draw.rect(self.screen, (26, 0, 48), self.test_btn_rect)
         pygame.draw.rect(self.screen, (170, 102, 255), self.test_btn_rect, 1)
-        test_txt = self.font_small.render("⬤ HOLD TO TEST AUDIO", True, (170, 102, 255))
-        self.screen.blit(test_txt, (self.test_btn_rect.x + 5, self.test_btn_rect.y + 8))
+        test_txt = self.font_small.render("HOLD TEST AUDIO", True, (170, 102, 255))
+        self.screen.blit(test_txt, (self.test_btn_rect.centerx - test_txt.get_width() // 2,
+                                    self.test_btn_rect.y + 12))
         
         pygame.display.flip()
 
@@ -311,6 +369,11 @@ class VoiceChatApp:
         if current_line:
             lines.append(current_line.strip())
         return lines
+
+    def _brain_label(self):
+        parsed = urllib.parse.urlparse(self.brain_url)
+        host = parsed.netloc or self.brain_url
+        return f"{host} · {self.model}"
 
     def _draw_speed_slider(self):
         cy = self.height - 220  # Vertical center of slider row
@@ -348,13 +411,17 @@ class VoiceChatApp:
 
     def _draw_mic_button(self):
         cfg = {
-            "loading":    (C["btn_idle"], C["ring_idle"], "…",  "loading models"),
-            "idle":       (C["btn_idle"], C["ring_idle"], "🎙", "click to speak"),
-            "recording":  (C["btn_rec"],  C["ring_rec"],  "⏹", "click to send"),
-            "processing": (C["btn_proc"], C["ring_proc"], "⋯",  "processing…"),
-            "speaking":   (C["btn_talk"], C["ring_talk"], "♪",  "speaking…"),
+            "loading":      (C["btn_idle"], C["ring_idle"],    "…",  "loading models"),
+            "idle":         (C["btn_idle"], C["ring_idle"],    "🎙", "click to speak"),
+            "brain_offline":(C["btn_idle"], (180, 50, 50),    "✗",  "brain offline…"),
+            "recording":    (C["btn_rec"],  C["ring_rec"],    "⏹", "click to send"),
+            "processing":   (C["btn_proc"], C["ring_proc"],   "⋯",  "processing…"),
+            "speaking":     (C["btn_talk"], C["ring_talk"],   "♪",  "speaking…"),
         }
-        bg, ring, symbol, hint = cfg.get(self.state, cfg["idle"])
+        effective_state = self.state
+        if self.state == "idle" and not self.brain_connected:
+            effective_state = "brain_offline"
+        bg, ring, symbol, hint = cfg.get(effective_state, cfg["idle"])
         self.hint_msg = hint
         
         # Glow rings
@@ -386,8 +453,7 @@ class VoiceChatApp:
                     use_cuda=False,
                 )
 
-            self._set_status("Connecting to LM Studio on thebrain…")
-            self.llm = OpenAI(base_url=THEBRAIN_URL, api_key="lm-studio")
+            self.llm = OpenAI(base_url=self.brain_url, api_key="lm-studio")
             self.conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
 
             # Open always-on input stream
@@ -398,13 +464,128 @@ class VoiceChatApp:
             self.stream.start()
 
             self._set_state("idle")
-            self._set_status("Ready — click the mic to speak")
-            self.lang_badge = "speak EN or FR"
+            self.lang_badge = self._brain_label()
             self._log("AI", "en",
                       "Bonjour ! I'm your French tutor. Speak in English or French "
                       "— I'll match your language automatically.")
+            if self.brain_connected:
+                self._set_status(self._ready_status())
+            else:
+                self._set_status(self._ready_status())
         except Exception as e:
             self._set_status(f"Startup error: {e}")
+
+    # ── Brain watchdog ────────────────────────────────────────────────────────
+    def _brain_watchdog(self):
+        """Polls LM Studio every 3 s; updates brain_connected and notifies on state change."""
+        prev = None
+        while True:
+            connected = self._brain_api_ready(timeout=3)
+
+            if connected != prev:
+                self.brain_connected = connected
+                if self.state != "loading":
+                    if connected:
+                        self._log_sys("Brain reconnected!")
+                        self._set_status(self._ready_status())
+                    else:
+                        self._log_sys("Brain went offline.")
+                        self._set_status(self._ready_status())
+                prev = connected
+
+            time.sleep(3)
+
+    def _brain_api_ready(self, timeout=3):
+        try:
+            with urllib.request.urlopen(self.brain_url + "/models", timeout=timeout) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    def _wait_for_brain_api(self, seconds=45):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self._brain_api_ready(timeout=3):
+                self.brain_connected = True
+                self.llm = OpenAI(base_url=self.brain_url, api_key="lm-studio")
+                self._set_status(self._ready_status())
+                return True
+            time.sleep(1)
+        return False
+
+    def _start_brain(self):
+        if self.brain_starting:
+            return
+        threading.Thread(target=self._start_brain_worker, daemon=True).start()
+
+    def _start_brain_worker(self):
+        self.brain_starting = True
+        try:
+            command = self.config.get("brain_start_command") or []
+            start_url = (self.config.get("brain_start_url") or "").strip()
+
+            if isinstance(command, str):
+                command = shlex.split(command)
+
+            if command:
+                self._log_sys("Starting Brain with configured command...")
+                self._set_status("Starting Brain...")
+                self._log_debug(f"brain start command: {command!r}")
+                proc = subprocess.run(command, capture_output=True, text=True, timeout=90)
+                if proc.returncode == 0:
+                    self._log_debug(f"brain start stdout: {proc.stdout.strip()}")
+                    self._log_debug(f"brain start stderr: {proc.stderr.strip()}")
+                    self._log_sys("Brain start command finished. Checking LM Studio...")
+                    self._set_status("Checking Brain API...")
+                    if self._wait_for_brain_api():
+                        self._log_sys("Brain is online. Ready to chat.")
+                    else:
+                        self._log_sys("Brain command finished, but the API did not come online.")
+                        self._set_status("Brain start finished, but API is still offline")
+                else:
+                    err = (proc.stderr or proc.stdout or "").strip()
+                    self._log_sys(f"Brain start command failed: {err or proc.returncode}")
+                    self._set_status("Brain start command failed")
+                return
+
+            if start_url:
+                method = (self.config.get("brain_start_url_method") or "POST").upper()
+                self._log_sys("Sending Brain start request...")
+                self._set_status("Sending Brain start request...")
+                req = urllib.request.Request(start_url, method=method)
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    r.read()
+                self._log_sys("Brain start request sent. Checking LM Studio...")
+                self._set_status("Checking Brain API...")
+                if self._wait_for_brain_api():
+                    self._log_sys("Brain is online. Ready to chat.")
+                else:
+                    self._log_sys("Brain start request sent, but the API did not come online.")
+                    self._set_status("Brain start request sent, but API is still offline")
+                return
+
+            self._log_sys("No Brain start command is configured yet.")
+            self._set_status("Edit voicechat_config.json to configure START BRAIN")
+        except subprocess.TimeoutExpired:
+            self._log_sys("Brain start command timed out after 60 seconds.")
+            self._set_status("Brain start timed out")
+        except Exception as e:
+            self._log_sys(f"Brain start failed: {e}")
+            self._set_status(f"Brain start failed: {e}")
+        finally:
+            self.brain_starting = False
+
+    def _log_sys(self, text):
+        self.transcript.append(("SYS", "en", text, False))
+        self._scroll_to_bottom = True
+
+    def _log_debug(self, msg):
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"[{stamp}] {msg}\n")
+        except Exception:
+            pass
 
     # ── Audio ─────────────────────────────────────────────────────────────────
     def _audio_cb(self, indata, frames, time, status):
@@ -430,7 +611,7 @@ class VoiceChatApp:
                 self._set_status("No audio recorded — try again")
                 time.sleep(1.5)
                 self._set_state("idle")
-                self._set_status("Ready — click the mic to speak")
+                self._set_status(self._ready_status())
                 return
 
             audio = np.concatenate(chunks, axis=0)
@@ -438,7 +619,7 @@ class VoiceChatApp:
                 self._set_status("Too short — hold longer next time")
                 time.sleep(1.5)
                 self._set_state("idle")
-                self._set_status("Ready — click the mic to speak")
+                self._set_status(self._ready_status())
                 return
 
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -456,7 +637,7 @@ class VoiceChatApp:
                 self._set_status("No speech detected — try again")
                 time.sleep(1.5)
                 self._set_state("idle")
-                self._set_status("Ready — click the mic to speak")
+                self._set_status(self._ready_status())
                 return
 
             self._log("You", detected, user_text)
@@ -477,9 +658,14 @@ class VoiceChatApp:
                 "content": f"{user_text}  [{lang_directive}]",
             })
 
+            if not self.brain_connected:
+                self._log_sys("Brain is offline. Press START BRAIN or wait for reconnect.")
+                self._set_status("Brain offline — cannot send message yet")
+                return
+
             self._set_status("Thinking on thebrain…")
             resp = self.llm.chat.completions.create(
-                model=MODEL,
+                model=self.model,
                 messages=self.conversation,
                 max_tokens=300,
             )
@@ -492,6 +678,7 @@ class VoiceChatApp:
                 reply = "Je ne sais pas." if detected == "fr" else "I'm not sure."
 
             self.conversation.append({"role": "assistant", "content": reply})
+            self._trim_conversation()
             clean_reply = _strip_lang_tags(reply)
             ai_line_idx = self._log("AI", detected, clean_reply)
 
@@ -505,11 +692,19 @@ class VoiceChatApp:
             if wav_path and os.path.exists(wav_path):
                 os.unlink(wav_path)
             self._set_state("idle")
-            self._set_status("Ready — click the mic to speak")
+            self._set_status(self._ready_status())
+
+    def _trim_conversation(self):
+        if not self.conversation:
+            return
+        system = self.conversation[:1]
+        recent = self.conversation[1:][-self.max_history_turns * 2:]
+        self.conversation = system + recent
 
     def _speak(self, text, lang, line_idx=None):
         """Sentence-level synthesis (natural audio) + proportional word highlighting."""
         segments = _parse_lang_tags(text, default_lang=lang)
+        self._log_debug(f"TTS start lang={lang} rate={self.speech_rate:.2f} text={_strip_lang_tags(text)!r}")
 
         # Build (voice, seg_text, [words]) per segment, skipping bare punctuation words
         parsed = []
@@ -538,6 +733,7 @@ class VoiceChatApp:
                     voice.synthesize_wav(seg_text, wf, syn_config=syn_config)
                 buf.seek(0)
                 audio, _ = sf.read(buf, dtype="float32")
+                self._log_debug(f"TTS segment generated samples={len(audio)} text={seg_text!r}")
                 seg_audios.append(audio)
 
             # ── Pass 2: synthesize each word alone → duration proportions only ──
@@ -582,21 +778,25 @@ class VoiceChatApp:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 wav_path = f.name
             sf.write(wav_path, combined, SR)
+            file_size = os.path.getsize(wav_path)
+            duration = len(combined) / SR
+            self._log_debug(f"TTS wav ready path={wav_path} bytes={file_size} duration={duration:.2f}s")
 
-            proc = subprocess.Popen(["paplay", wav_path],
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.PIPE)
+            proc = self._play_tts_wav(wav_path)
 
             for word_idx, dur in enumerate(word_durations):
                 self.speaking_word_idx = word_idx
                 time.sleep(dur)
 
-            proc.wait(timeout=30)
-            if proc.returncode != 0:
-                err = proc.stderr.read().decode(errors="replace").strip()
-                print(f"[TTS] paplay failed: {err}", file=sys.stderr)
+            if proc:
+                proc.wait(timeout=30)
+                if proc.returncode != 0:
+                    stderr = proc.stderr.read() if proc.stderr else b""
+                    err = stderr.decode(errors="replace").strip()
+                    self._log_debug(f"TTS playback failed returncode={proc.returncode} err={err}")
 
         except Exception as e:
+            self._log_debug(f"TTS exception: {e}")
             print(f"[TTS] Exception: {e}", file=sys.stderr)
             self._set_status(f"TTS error: {e}")
         finally:
@@ -607,6 +807,33 @@ class VoiceChatApp:
                     os.unlink(wav_path)
                 except Exception:
                     pass
+
+    def _play_tts_wav(self, wav_path):
+        for player in ("paplay", "aplay"):
+            try:
+                proc = subprocess.Popen([player, wav_path],
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE)
+                time.sleep(0.15)
+                if proc.poll() is None or proc.returncode == 0:
+                    self._log_debug(f"TTS playback started with {player}")
+                    return proc
+                stderr = proc.stderr.read() if proc.stderr else b""
+                err = stderr.decode(errors="replace").strip()
+                self._log_debug(f"TTS {player} failed immediately: {err}")
+            except FileNotFoundError:
+                self._log_debug(f"TTS player not found: {player}")
+            except Exception as e:
+                self._log_debug(f"TTS {player} exception: {e}")
+
+        try:
+            audio, sr = sf.read(wav_path, dtype="float32")
+            self._log_debug(f"TTS falling back to sounddevice samples={len(audio)} sr={sr}")
+            sd.play(audio, sr, blocking=False)
+        except Exception as e:
+            self._log_debug(f"TTS sounddevice fallback failed: {e}")
+            self._set_status(f"TTS playback failed: {e}")
+        return None
 
     def _play_beep(self):
         sr = 48000
@@ -635,6 +862,11 @@ class VoiceChatApp:
     def _set_status(self, msg):
         self.status_msg = msg
 
+    def _ready_status(self):
+        if self.brain_connected:
+            return "Ready — click the mic to speak"
+        return "Brain offline — press START BRAIN or wait for reconnect"
+
     def _update_speech_rate(self, mouse_x):
         if self._slider_track is None:
             return
@@ -649,8 +881,15 @@ class VoiceChatApp:
             if self._slider_track and self._slider_track.collidepoint(event.pos):
                 self.slider_dragging = True
                 self._update_speech_rate(event.pos[0])
+            elif self.start_btn_rect.collidepoint(event.pos):
+                if self.brain_connected:
+                    self._set_status("Brain is already online")
+                else:
+                    self._start_brain()
             elif self.btn_mic_rect.collidepoint(event.pos):
-                if self.state == "idle":
+                if self.state == "idle" and not self.brain_connected:
+                    self._set_status("Brain is offline — waiting to reconnect…")
+                elif self.state == "idle":
                     self._start_rec()
                 elif self.state == "recording":
                     self._stop_rec()
@@ -662,11 +901,14 @@ class VoiceChatApp:
                 self._update_speech_rate(event.pos[0])
         elif event.type == pygame.MOUSEBUTTONUP:
             self.slider_dragging = False
-            self.beeping = False
-            sd.stop()
+            if self.beeping:
+                self.beeping = False
+                sd.stop()
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_SPACE:
-                if self.state == "idle":
+                if self.state == "idle" and not self.brain_connected:
+                    self._set_status("Brain is offline — waiting to reconnect…")
+                elif self.state == "idle":
                     self._start_rec()
                 elif self.state == "recording":
                     self._stop_rec()
@@ -689,8 +931,10 @@ class VoiceChatApp:
             self.width, self.height = event.size
             self.btn_mic_rect = pygame.Rect(self.width // 2 - 65,
                                            self.height - 200, 130, 130)
-            self.test_btn_rect = pygame.Rect(self.width // 2 - 75,
-                                            self.height - 60, 150, 40)
+            self.start_btn_rect = pygame.Rect(self.width // 2 - 170,
+                                             self.height - 60, 160, 40)
+            self.test_btn_rect = pygame.Rect(self.width // 2 + 10,
+                                            self.height - 60, 160, 40)
 
     def run(self):
         self.running = True
